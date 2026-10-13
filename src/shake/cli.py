@@ -1178,3 +1178,13 @@ def wait_cmd(
         print(json.dumps({"status": "timeout"}))
     else:
         console.print("[dim]Wait timeout expired. No new messages.[/dim]")
+
+
+@app.command("mcp")
+def mcp_cmd() -> None:
+    """Launch Model Context Protocol (MCP) server over standard I/O for Muse / Claude."""
+    from shake.adapters.mcp import ShakeMcpServer
+
+    server = ShakeMcpServer()
+    server.run_stdio()
+
