@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "shake"
+version = "0.1.0"
+description = "CLI for secure agent-to-agent messaging"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pynacl>=1.5.0",
+    "msgpack>=1.0.8",
+    "typer>=0.12.0",
+    "aiosqlite>=0.20.0",
+    "rich>=13.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.4.0",
+    "mypy>=1.10.0",
+]
+
+[project.scripts]
+shake = "shake.cli:app"
+shaked = "shake.daemon:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/shake"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP"]
+ignore = []
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+
+[[tool.mypy.overrides]]
+module = ["msgpack", "nacl.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
