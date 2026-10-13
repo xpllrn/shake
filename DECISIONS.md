@@ -39,3 +39,31 @@ This document records architectural and implementation decisions for `shake`.
 ## 8. Multi-Agent Ecosystem Compatibility (Meta Muse, Claude Code, Codex, MCP)
 - **Decision**: The entire core runtime, identity management, envelope validation, and routing layer are 100% deterministic Python without LLM dependencies.
 - **Rationale**: Agents from any runtime (Meta Muse, Claude Code, Codex CLI, Gemini CLI, custom LLM loops, or MCP tools) communicate over standard CLI / JSON or Unix socket without runtime impedance.
+
+## 9. Handshake State Machine & Mutual Verification
+- **Decision**: Contacts transition through explicit states: `none` -> `requested_out` / `requested_in` -> `pending_verify` -> `verified` -> `trusted` (or `blocked`).
+- **Code verification**: Both agents compute a 6-digit symmetric code derived from their sorted public keys and 32-byte nonces. Verification is evaluated in constant time (`nacl.bindings.sodium_memcmp`).
+- **Brute-Force Mitigation**: Sessions are locked after 3 failed verification attempts and automatically expire after 5 minutes (300 seconds).
+- **Key Pinning Enforcement**: Once verified, a peer's public key is permanently pinned. If a peer attempts to re-verify or reconnect with a different public key under the same `peer_id`, `KeyPinningViolationError` is raised immediately.
+
+## 10. Rate Limiting & Denial-of-Service Defense
+- **Decision**: Connect requests are throttled at two levels:
+  1. Maximum 10 outbound connect requests per hour per local agent.
+  2. Maximum 50 pending inbound requests in the local agent's queue.
+- **Rationale**: Prevents malicious or misconfigured agents from spamming connection requests or exhausting SQLite storage.
+
+## 11. Tincan Comparison: Patterns Adopted & Limits Fixed
+- **Adopted Pattern 1: Capability Routing (`good_at`)**:
+  - Agents and contacts declare what tasks or skills they excel at via `good_at` (e.g. `shake agent good-at "Python, Docker"`).
+  - Contacts can be queried with `good_at` capabilities for intelligent agent dispatch.
+- **Adopted Pattern 2: Dynamic Egress Proxy Handling for Meta Muse**:
+  - Sandboxed agents running behind corporate or sandbox egress proxies (e.g. `hatch-egress-proxy:3128` with rotating credentials) require fresh environment resolution. `src/shake/env.py` dynamically extracts valid proxy credentials on demand.
+- **Fixed Limit 1: Zero-Trust Security vs Unauthenticated Network Headers**:
+  - Tincan relied on unauthenticated network headers / Tailscale WhoIs without message authentication. Shake signs every envelope with Ed25519, verifies signatures locally with pinned public keys, and rejects all untrusted peers.
+- **Fixed Limit 2: Mutual 6-Digit Verification vs Central Invite Codes**:
+  - Tincan used static invite codes. Shake uses an ephemeral, symmetric 6-digit out-of-band verification handshake with cryptographic nonces and a 3-attempt lockout.
+- **Fixed Limit 3: Guaranteed 60-Second Reply Deadline**:
+  - Tincan queued requests indefinitely. Shake enforces an instant ACK and a hard 60-second reply deadline with receiving runtime timeout fallback at 45 seconds.
+- **Fixed Limit 4: Conversation Turn Cap & Deduping**:
+  - Tincan allowed infinite agent loops. Shake enforces a 20-turn cap per thread and duplicate message filtering via monotonic ULIDs.
+

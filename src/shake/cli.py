@@ -28,6 +28,13 @@ agent_app = typer.Typer(
 )
 app.add_typer(agent_app, name="agent")
 
+contact_app = typer.Typer(
+    name="contact",
+    help="Manage peer contacts, trust, and pairing requests.",
+    no_args_is_help=True,
+)
+app.add_typer(contact_app, name="contact")
+
 console = Console()
 err_console = Console(stderr=True)
 
@@ -575,3 +582,323 @@ def agent_use_cmd(
     """Set the active agent identity for the current directory (.shake/identity)."""
     p = ShakeConfig.set_project_identity(agent_id)
     console.print(f"[green]✓[/green] Set active agent {agent_id} in {p}")
+
+
+@agent_app.command("good-at")
+def agent_good_at_cmd(
+    skills: str = typer.Argument(..., help="What this agent excels at"),
+    agent_id: str | None = typer.Option(
+        None, "--agent", "-a", help="Agent ID (defaults to active agent)"
+    ),
+) -> None:
+    """Set the capability description (good_at) for an agent."""
+    config = ShakeConfig()
+    target_id = agent_id
+    if not target_id:
+        active = resolve_active_agent(config)
+        if active:
+            target_id = active["agent_id"]
+
+    if not target_id:
+        err_console.print("[red]Error:[/red] No agent specified or active.")
+        raise typer.Exit(code=1)
+
+    client = get_client()
+    try:
+        client.call_sync("agent_good_at", {"agent_id": target_id, "good_at": skills})
+        console.print(f"[green]✓[/green] Updated good_at for agent {target_id}: '{skills}'")
+    except DaemonNotRunningError:
+        config = ShakeConfig()
+        if config.db_path.exists():
+            import sqlite3
+
+            conn = sqlite3.connect(str(config.db_path))
+            try:
+                conn.execute(
+                    "UPDATE agents SET good_at = ? WHERE agent_id = ?;",
+                    (skills, target_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            console.print(f"[green]✓[/green] Updated good_at for agent {target_id}: '{skills}'")
+        else:
+            err_console.print("[red]Error:[/red] Database not initialized. Run `shake init`.")
+            raise typer.Exit(code=1)
+    except Exception as e:
+        err_console.print(f"[red]Error updating good_at:[/red] {e}")
+        raise typer.Exit(code=1)
+
+
+# ---------------------------------------------------------------------------
+# Handshake & Verification Commands
+# ---------------------------------------------------------------------------
+
+
+@app.command("connect")
+def connect_cmd(
+    peer_id: str = typer.Argument(..., help="Target agent ID to connect with"),
+) -> None:
+    """Initiate or accept a connection request with an agent."""
+    config = ShakeConfig()
+    active = resolve_active_agent(config)
+    if not active:
+        err_console.print(
+            "[red]Error:[/red] No active agent. Set .shake/identity or SHAKE_AGENT=<id>."
+        )
+        raise typer.Exit(code=1)
+
+    local_id = active["agent_id"]
+    if local_id == peer_id:
+        err_console.print("[red]Error:[/red] An agent cannot connect to itself.")
+        raise typer.Exit(code=1)
+
+    client = get_client()
+    try:
+        res = client.call_sync(
+            "connect",
+            {
+                "local_agent_id": local_id,
+                "peer_id": peer_id,
+                "peer_name": f"Agent {peer_id}",
+            },
+        )
+        data = res.get("data", {})
+        state = data.get("state")
+
+        if state == "pending_verify":
+            code = data.get("code")
+            console.print("\n[bold green]Pairing request accepted![/bold green]")
+            console.print(
+                f"Mutual verification code: [bold yellow on black] {code} [/bold yellow on black]"
+            )
+            console.print(
+                "\nConfirm this 6-digit code matches the peer's out-of-band, then run:\n"
+                f"  [bold cyan]shake verify {peer_id} {code}[/bold cyan]\n"
+            )
+        else:
+            console.print(
+                f"[green]✓[/green] Connect request delivered to [bold]{peer_id}[/bold] "
+                f"(state: [cyan]{state}[/cyan])."
+            )
+            console.print(
+                f"Peer must run [bold cyan]shake connect {local_id}[/bold cyan] to accept. "
+                "Session expires in 5 minutes."
+            )
+    except Exception as e:
+        err_console.print(f"[red]Connect failed:[/red] {e}")
+        raise typer.Exit(code=1)
+
+
+@app.command("verify")
+def verify_cmd(
+    peer_id: str = typer.Argument(..., help="Peer agent ID to verify"),
+    code: str = typer.Argument(..., help="6-digit verification code"),
+) -> None:
+    """Enter the 6-digit code to complete mutual verification and pin the peer's key."""
+    config = ShakeConfig()
+    active = resolve_active_agent(config)
+    if not active:
+        err_console.print("[red]Error:[/red] No active agent selected.")
+        raise typer.Exit(code=1)
+
+    local_id = active["agent_id"]
+    client = get_client()
+    try:
+        client.call_sync(
+            "verify",
+            {
+                "local_agent_id": local_id,
+                "peer_id": peer_id,
+                "code": code,
+            },
+        )
+        console.print(
+            f"\n[bold green]✓ Mutual verification successful![/bold green] "
+            f"Agent [bold]{peer_id}[/bold] is now [cyan]verified[/cyan]."
+        )
+        console.print("Public key pinned. You can now exchange secure messages.\n")
+    except Exception as e:
+        err_console.print(f"[red]Verification failed:[/red] {e}")
+        raise typer.Exit(code=1)
+
+
+@app.command("disconnect")
+def disconnect_cmd(
+    peer_id: str = typer.Argument(..., help="Peer agent ID to disconnect"),
+) -> None:
+    """Remove contact, delete pinned key, and terminate sessions."""
+    config = ShakeConfig()
+    active = resolve_active_agent(config)
+    local_id = active["agent_id"] if active else ""
+
+    client = get_client()
+    try:
+        client.call_sync("disconnect", {"local_agent_id": local_id, "peer_id": peer_id})
+        console.print(f"[green]✓[/green] Disconnected from agent {peer_id} (pinned key deleted).")
+    except Exception as e:
+        err_console.print(f"[red]Disconnect failed:[/red] {e}")
+        raise typer.Exit(code=1)
+
+
+# ---------------------------------------------------------------------------
+# Contact Management Commands
+# ---------------------------------------------------------------------------
+
+
+@contact_app.command("list")
+def contact_list_cmd(
+    json_output: bool = typer.Option(False, "--json", help="Output contacts as JSON"),
+) -> None:
+    """List peer contacts and their verification states."""
+    client = get_client()
+    contacts: list[dict[str, Any]] = []
+    try:
+        res = client.call_sync("contact_list")
+        contacts = res.get("data", {}).get("contacts", [])
+    except DaemonNotRunningError:
+        config = ShakeConfig()
+        if config.db_path.exists():
+            import sqlite3
+
+            from shake.crypto import format_fingerprint
+
+            conn = sqlite3.connect(str(config.db_path))
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT peer_id, name, pubkey, state, pinned_at, "
+                    "updated_at, good_at FROM contacts ORDER BY updated_at DESC;"
+                )
+                rows = cur.fetchall()
+                contacts = [
+                    {
+                        "peer_id": str(r[0]),
+                        "name": str(r[1]),
+                        "fingerprint": format_fingerprint(bytes(r[2])) if r[2] else None,
+                        "state": str(r[3]),
+                        "pinned_at": int(r[4]) if r[4] else None,
+                        "updated_at": int(r[5]),
+                        "good_at": str(r[6] or ""),
+                    }
+                    for r in rows
+                ]
+            finally:
+                conn.close()
+    except Exception as e:
+        err_console.print(f"[red]Error listing contacts:[/red] {e}")
+        raise typer.Exit(code=1)
+
+    if json_output:
+        console.print(json.dumps(contacts, indent=2))
+    else:
+        if not contacts:
+            console.print("No contacts found. Use `shake connect <agent_id>` to pair.")
+            return
+
+        table = Table(title="Contacts", box=box.ROUNDED)
+        table.add_column("Peer ID", style="bold cyan")
+        table.add_column("Name", style="green")
+        table.add_column("State", style="bold yellow")
+        table.add_column("Fingerprint", style="magenta")
+        table.add_column("Good At", style="dim")
+        table.add_column("Pinned At", style="dim")
+
+        for c in contacts:
+            pinned_str = (
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(c["pinned_at"] / 1000))
+                if c.get("pinned_at")
+                else "-"
+            )
+            table.add_row(
+                c["peer_id"],
+                c["name"],
+                c["state"],
+                c["fingerprint"] or "-",
+                c.get("good_at") or "-",
+                pinned_str,
+            )
+        console.print(table)
+
+
+@contact_app.command("requests")
+def contact_requests_cmd(
+    json_output: bool = typer.Option(False, "--json", help="Output requests as JSON"),
+) -> None:
+    """List pending inbound connection requests."""
+    config = ShakeConfig()
+    active = resolve_active_agent(config)
+    local_id = active["agent_id"] if active else ""
+
+    client = get_client()
+    try:
+        res = client.call_sync("contact_requests", {"local_agent_id": local_id})
+        reqs = res.get("data", {}).get("requests", [])
+        if json_output:
+            console.print(json.dumps(reqs, indent=2))
+        else:
+            if not reqs:
+                console.print("No pending inbound requests.")
+                return
+
+            table = Table(title="Inbound Contact Requests", box=box.ROUNDED)
+            table.add_column("From Agent ID", style="bold cyan")
+            table.add_column("Name", style="green")
+            table.add_column("Fingerprint", style="magenta")
+            table.add_column("Action", style="yellow")
+
+            for r in reqs:
+                table.add_row(
+                    r["peer_id"],
+                    r["name"],
+                    r["fingerprint"] or "-",
+                    f"shake connect {r['peer_id']}",
+                )
+            console.print(table)
+    except Exception as e:
+        err_console.print(f"[red]Error listing requests:[/red] {e}")
+        raise typer.Exit(code=1)
+
+
+@contact_app.command("trust")
+def contact_trust_cmd(
+    peer_id: str = typer.Argument(..., help="Verified agent ID to mark as trusted"),
+) -> None:
+    """Promote a verified contact to trusted status."""
+    client = get_client()
+    try:
+        client.call_sync("contact_trust", {"peer_id": peer_id})
+        console.print(
+            f"[green]✓[/green] Contact {peer_id} marked as [bold green]trusted[/bold green]."
+        )
+    except Exception as e:
+        err_console.print(f"[red]Error marking contact as trusted:[/red] {e}")
+        raise typer.Exit(code=1)
+
+
+@contact_app.command("block")
+def contact_block_cmd(
+    peer_id: str = typer.Argument(..., help="Agent ID to block"),
+) -> None:
+    """Block an agent and drop all future messages from it."""
+    client = get_client()
+    try:
+        client.call_sync("contact_block", {"peer_id": peer_id})
+        console.print(f"[green]✓[/green] Contact {peer_id} is now [bold red]blocked[/bold red].")
+    except Exception as e:
+        err_console.print(f"[red]Error blocking contact:[/red] {e}")
+        raise typer.Exit(code=1)
+
+
+@contact_app.command("unblock")
+def contact_unblock_cmd(
+    peer_id: str = typer.Argument(..., help="Agent ID to unblock"),
+) -> None:
+    """Unblock a contact."""
+    client = get_client()
+    try:
+        client.call_sync("contact_unblock", {"peer_id": peer_id})
+        console.print(f"[green]✓[/green] Contact {peer_id} has been [green]unblocked[/green].")
+    except Exception as e:
+        err_console.print(f"[red]Error unblocking contact:[/red] {e}")
+        raise typer.Exit(code=1)

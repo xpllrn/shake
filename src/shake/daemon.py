@@ -10,6 +10,7 @@ from pathlib import Path
 
 from shake.config import ShakeConfig
 from shake.crypto import KeyPair, format_fingerprint, generate_agent_id
+from shake.pairing import PairingManager
 from shake.protocol import IpcRequest, IpcResponse
 from shake.store import Store
 from shake.transport.unix import UnixTransport, write_frame
@@ -23,6 +24,7 @@ class Daemon:
     def __init__(self, config: ShakeConfig | None = None) -> None:
         self.config = config or ShakeConfig()
         self.store = Store(self.config.db_path)
+        self.pairing = PairingManager(self.store)
         self.transport = UnixTransport(self.config.socket_path)
         self.start_time: float = 0.0
         self._stop_event = asyncio.Event()
@@ -145,14 +147,127 @@ class Daemon:
                     data={"deleted": deleted, "agent_id": agent_id},
                 )
 
+            elif action == "connect":
+                local_agent_id = str(params.get("local_agent_id", "")).strip()
+                peer_id = str(params.get("peer_id", "")).strip()
+                peer_name = str(params.get("peer_name", "")).strip()
+                peer_pubkey_raw = params.get("peer_pubkey")
+                peer_pubkey = bytes(peer_pubkey_raw) if peer_pubkey_raw else None
+
+                result = await self.pairing.initiate_connect(
+                    local_agent_id=local_agent_id,
+                    peer_id=peer_id,
+                    peer_name=peer_name,
+                    peer_pubkey=peer_pubkey,
+                )
+                resp = IpcResponse(id=req_id, ok=True, data=result)
+
+            elif action == "verify":
+                local_agent_id = str(params.get("local_agent_id", "")).strip()
+                peer_id = str(params.get("peer_id", "")).strip()
+                code = str(params.get("code", "")).strip()
+
+                result = await self.pairing.verify_code(
+                    local_agent_id=local_agent_id,
+                    peer_id=peer_id,
+                    code=code,
+                )
+                resp = IpcResponse(id=req_id, ok=True, data=result)
+
+            elif action == "disconnect":
+                local_agent_id = str(params.get("local_agent_id", "")).strip()
+                peer_id = str(params.get("peer_id", "")).strip()
+                success = await self.pairing.disconnect(local_agent_id, peer_id)
+                resp = IpcResponse(
+                    id=req_id,
+                    ok=True,
+                    data={"disconnected": success, "peer_id": peer_id},
+                )
+
+            elif action == "contact_list":
+                state_filter = params.get("state")
+                contacts = await self.store.list_contacts(
+                    state=str(state_filter) if state_filter else None
+                )
+                contacts_data = [
+                    {
+                        "peer_id": c.peer_id,
+                        "name": c.name,
+                        "state": c.state,
+                        "fingerprint": format_fingerprint(c.pubkey) if c.pubkey else "",
+                        "pinned_at": c.pinned_at,
+                        "updated_at": c.updated_at,
+                        "good_at": c.good_at,
+                    }
+                    for c in contacts
+                ]
+                resp = IpcResponse(id=req_id, ok=True, data={"contacts": contacts_data})
+
+            elif action == "contact_requests":
+                local_agent_id = str(params.get("local_agent_id", "")).strip()
+                contacts = await self.store.list_contacts(state="requested_in")
+                contacts_data = [
+                    {
+                        "peer_id": c.peer_id,
+                        "name": c.name,
+                        "state": c.state,
+                        "fingerprint": format_fingerprint(c.pubkey) if c.pubkey else "",
+                        "updated_at": c.updated_at,
+                        "good_at": c.good_at,
+                    }
+                    for c in contacts
+                ]
+                resp = IpcResponse(id=req_id, ok=True, data={"requests": contacts_data})
+
+            elif action == "contact_trust":
+                peer_id = str(params.get("peer_id", "")).strip()
+                success = await self.pairing.trust(peer_id)
+                resp = IpcResponse(
+                    id=req_id, ok=True, data={"trusted": success, "peer_id": peer_id}
+                )
+
+            elif action == "contact_block":
+                peer_id = str(params.get("peer_id", "")).strip()
+                success = await self.pairing.block(peer_id)
+                resp = IpcResponse(
+                    id=req_id, ok=True, data={"blocked": success, "peer_id": peer_id}
+                )
+
+            elif action == "contact_unblock":
+                peer_id = str(params.get("peer_id", "")).strip()
+                success = await self.pairing.unblock(peer_id)
+                resp = IpcResponse(
+                    id=req_id, ok=True, data={"unblocked": success, "peer_id": peer_id}
+                )
+
+            elif action == "agent_good_at":
+                agent_id = str(params.get("agent_id", "")).strip()
+                good_at = str(params.get("good_at", "")).strip()
+                success = await self.store.update_agent_good_at(agent_id, good_at)
+                resp = IpcResponse(
+                    id=req_id, ok=True, data={"updated": success, "good_at": good_at}
+                )
+
+            elif action == "contact_good_at":
+                peer_id = str(params.get("peer_id", "")).strip()
+                good_at = str(params.get("good_at", "")).strip()
+                success = await self.store.update_contact_good_at(peer_id, good_at)
+                resp = IpcResponse(
+                    id=req_id, ok=True, data={"updated": success, "good_at": good_at}
+                )
+
             else:
                 resp = IpcResponse(id=req_id, ok=False, error=f"Unknown action: {action}")
 
         except Exception as e:
-            logger.exception("Error executing action %s: %s", action, e)
+            logger.exception("Error executing action %s", action)
             resp = IpcResponse(id=req_id, ok=False, error=str(e))
 
         await write_frame(reply_channel, resp.encode())
+
+    def stop(self) -> None:
+        """Trigger graceful shutdown of the daemon."""
+        self._stop_event.set()
 
     async def run(self) -> None:
         """Run daemon server until stopped."""
@@ -179,8 +294,8 @@ class Daemon:
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
                 loop.add_signal_handler(sig, self._stop_event.set)
-            except NotImplementedError:
-                # Signal handlers not implemented on Windows
+            except (NotImplementedError, RuntimeError, ValueError):
+                # Signal handlers not implemented on Windows or outside main thread
                 pass
 
         try:
