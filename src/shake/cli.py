@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 import typer
@@ -637,9 +638,17 @@ def agent_good_at_cmd(
 
 @app.command("connect")
 def connect_cmd(
-    peer_id: str = typer.Argument(..., help="Target agent ID to connect with"),
+    peer_id: str | None = typer.Argument(
+        None, help="Target agent ID to connect with (optional if --from-blob / --from-file is used)"
+    ),
+    from_blob: str | None = typer.Option(
+        None, "--from-blob", help="Signed connection token to import"
+    ),
+    from_file: Path | None = typer.Option(
+        None, "--from-file", help="Path to file containing connection token"
+    ),
 ) -> None:
-    """Initiate or accept a connection request with an agent."""
+    """Initiate or accept a connection request with an agent using signed envelopes."""
     config = ShakeConfig()
     active = resolve_active_agent(config)
     if not active:
@@ -649,42 +658,72 @@ def connect_cmd(
         raise typer.Exit(code=1)
 
     local_id = active["agent_id"]
-    if local_id == peer_id:
+
+    token = from_blob
+    if from_file:
+        if not from_file.exists():
+            err_console.print(f"[red]Error:[/red] Token file not found: {from_file}")
+            raise typer.Exit(code=1)
+        token = from_file.read_text(encoding="utf-8").strip()
+
+    if not peer_id and not token:
+        err_console.print("[red]Error:[/red] Specify peer_id or pass --from-blob / --from-file.")
+        raise typer.Exit(code=1)
+
+    if peer_id and local_id == peer_id:
         err_console.print("[red]Error:[/red] An agent cannot connect to itself.")
         raise typer.Exit(code=1)
 
     client = get_client()
     try:
-        res = client.call_sync(
-            "connect",
-            {
-                "local_agent_id": local_id,
-                "peer_id": peer_id,
-                "peer_name": f"Agent {peer_id}",
-            },
-        )
+        call_params: dict[str, Any] = {"local_agent_id": local_id}
+        if token:
+            call_params["token"] = token
+        else:
+            call_params["peer_id"] = peer_id
+            call_params["peer_name"] = f"Agent {peer_id}"
+
+        res = client.call_sync("connect", call_params)
         data = res.get("data", {})
         state = data.get("state")
+        out_token = data.get("token")
+        effective_peer = data.get("peer_id") or peer_id
 
         if state == "pending_verify":
             code = data.get("code")
-            console.print("\n[bold green]Pairing request accepted![/bold green]")
             console.print(
-                f"Mutual verification code: [bold yellow on black] {code} [/bold yellow on black]"
+                "\n[bold green]Handshake established (state: pending_verify)![/bold green]"
             )
             console.print(
-                "\nConfirm this 6-digit code matches the peer's out-of-band, then run:\n"
-                f"  [bold cyan]shake verify {peer_id} {code}[/bold cyan]\n"
+                f"\nMutual SAS code: [bold yellow on black]  {code}  [/bold yellow on black]\n"
             )
+            console.print("[bold red]CRITICAL SAS VERIFICATION:[/bold red]")
+            console.print(
+                "1. Confirm this 6-digit code matches the peer's terminal output."
+            )
+            console.print("2. Do NOT proceed until you have confirmed they match out-of-band.")
+            console.print("3. Both sides must now verify independently:")
+            console.print(
+                f"     [bold cyan]shake verify {effective_peer} <code_from_peer>[/bold cyan]\n"
+            )
+            if out_token:
+                console.print(
+                    "[dim]Response token (if pairing across machines/air-gap):[/dim]\n"
+                    f"[dim]{out_token}[/dim]\n"
+                )
         else:
             console.print(
-                f"[green]✓[/green] Connect request delivered to [bold]{peer_id}[/bold] "
+                f"[green]✓[/green] Connect request generated for [bold]{effective_peer}[/bold] "
                 f"(state: [cyan]{state}[/cyan])."
             )
-            console.print(
-                f"Peer must run [bold cyan]shake connect {local_id}[/bold cyan] to accept. "
-                "Session expires in 5 minutes."
-            )
+            if out_token:
+                console.print("\n[bold cyan]Connection Request Token:[/bold cyan]")
+                console.print(f"{out_token}\n")
+                console.print(
+                    "Deliver this token to the peer (via transport, file, or clipboard). "
+                    "Peer runs:\n"
+                    "  [bold cyan]shake connect --from-blob <token>[/bold cyan]\n"
+                )
     except Exception as e:
         err_console.print(f"[red]Connect failed:[/red] {e}")
         raise typer.Exit(code=1)
@@ -751,13 +790,16 @@ def contact_list_cmd(
     json_output: bool = typer.Option(False, "--json", help="Output contacts as JSON"),
 ) -> None:
     """List peer contacts and their verification states."""
+    config = ShakeConfig()
+    active = resolve_active_agent(config)
+    local_id = active["agent_id"] if active else ""
+
     client = get_client()
     contacts: list[dict[str, Any]] = []
     try:
-        res = client.call_sync("contact_list")
+        res = client.call_sync("contact_list", {"local_agent_id": local_id})
         contacts = res.get("data", {}).get("contacts", [])
     except DaemonNotRunningError:
-        config = ShakeConfig()
         if config.db_path.exists():
             import sqlite3
 
@@ -767,19 +809,21 @@ def contact_list_cmd(
             try:
                 cur = conn.cursor()
                 cur.execute(
-                    "SELECT peer_id, name, pubkey, state, pinned_at, "
-                    "updated_at, good_at FROM contacts ORDER BY updated_at DESC;"
+                    "SELECT owner_agent_id, peer_id, name, pubkey, state, pinned_at, "
+                    "updated_at, good_at FROM contacts WHERE owner_agent_id = ? "
+                    "ORDER BY updated_at DESC;",
+                    (local_id,),
                 )
                 rows = cur.fetchall()
                 contacts = [
                     {
-                        "peer_id": str(r[0]),
-                        "name": str(r[1]),
-                        "fingerprint": format_fingerprint(bytes(r[2])) if r[2] else None,
-                        "state": str(r[3]),
-                        "pinned_at": int(r[4]) if r[4] else None,
-                        "updated_at": int(r[5]),
-                        "good_at": str(r[6] or ""),
+                        "peer_id": str(r[1]),
+                        "name": str(r[2]),
+                        "fingerprint": format_fingerprint(bytes(r[3])) if r[3] else None,
+                        "state": str(r[4]),
+                        "pinned_at": int(r[5]) if r[5] else None,
+                        "updated_at": int(r[6]),
+                        "good_at": str(r[7] or ""),
                     }
                     for r in rows
                 ]
@@ -865,9 +909,13 @@ def contact_trust_cmd(
     peer_id: str = typer.Argument(..., help="Verified agent ID to mark as trusted"),
 ) -> None:
     """Promote a verified contact to trusted status."""
+    config = ShakeConfig()
+    active = resolve_active_agent(config)
+    local_id = active["agent_id"] if active else ""
+
     client = get_client()
     try:
-        client.call_sync("contact_trust", {"peer_id": peer_id})
+        client.call_sync("contact_trust", {"local_agent_id": local_id, "peer_id": peer_id})
         console.print(
             f"[green]✓[/green] Contact {peer_id} marked as [bold green]trusted[/bold green]."
         )
@@ -881,9 +929,13 @@ def contact_block_cmd(
     peer_id: str = typer.Argument(..., help="Agent ID to block"),
 ) -> None:
     """Block an agent and drop all future messages from it."""
+    config = ShakeConfig()
+    active = resolve_active_agent(config)
+    local_id = active["agent_id"] if active else ""
+
     client = get_client()
     try:
-        client.call_sync("contact_block", {"peer_id": peer_id})
+        client.call_sync("contact_block", {"local_agent_id": local_id, "peer_id": peer_id})
         console.print(f"[green]✓[/green] Contact {peer_id} is now [bold red]blocked[/bold red].")
     except Exception as e:
         err_console.print(f"[red]Error blocking contact:[/red] {e}")
@@ -895,9 +947,13 @@ def contact_unblock_cmd(
     peer_id: str = typer.Argument(..., help="Agent ID to unblock"),
 ) -> None:
     """Unblock a contact."""
+    config = ShakeConfig()
+    active = resolve_active_agent(config)
+    local_id = active["agent_id"] if active else ""
+
     client = get_client()
     try:
-        client.call_sync("contact_unblock", {"peer_id": peer_id})
+        client.call_sync("contact_unblock", {"local_agent_id": local_id, "peer_id": peer_id})
         console.print(f"[green]✓[/green] Contact {peer_id} has been [green]unblocked[/green].")
     except Exception as e:
         err_console.print(f"[red]Error unblocking contact:[/red] {e}")

@@ -6,6 +6,17 @@ from typing import Any
 
 import aiosqlite
 
+
+class StoreError(Exception):
+    """Base error for store operations."""
+    pass
+
+
+class KeyPinningViolationError(StoreError):
+    """Raised when an agent attempts to overwrite or change a pinned public key."""
+    pass
+
+
 MIGRATIONS: list[tuple[int, str]] = [
     (
         1,
@@ -24,12 +35,14 @@ MIGRATIONS: list[tuple[int, str]] = [
         );
 
         CREATE TABLE IF NOT EXISTS contacts (
-            peer_id TEXT PRIMARY KEY,
+            owner_agent_id TEXT NOT NULL,
+            peer_id TEXT NOT NULL,
             name TEXT NOT NULL,
             pubkey BLOB NOT NULL,
             state TEXT NOT NULL,
             pinned_at INTEGER,
-            updated_at INTEGER NOT NULL
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (owner_agent_id, peer_id)
         );
 
         CREATE TABLE IF NOT EXISTS pairing_sessions (
@@ -42,7 +55,8 @@ MIGRATIONS: list[tuple[int, str]] = [
             state TEXT NOT NULL,
             attempts INTEGER NOT NULL DEFAULT 0,
             expires_at INTEGER NOT NULL,
-            created_at INTEGER NOT NULL
+            created_at INTEGER NOT NULL,
+            UNIQUE (local_agent_id, peer_id)
         );
 
         CREATE TABLE IF NOT EXISTS rooms (
@@ -125,6 +139,29 @@ MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE contacts ADD COLUMN good_at TEXT DEFAULT '';
         """,
     ),
+    (
+        3,
+        """
+        -- Ensure contacts has (owner_agent_id, peer_id) compound primary key
+        CREATE TABLE IF NOT EXISTS contacts_v3 (
+            owner_agent_id TEXT NOT NULL,
+            peer_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            pubkey BLOB NOT NULL,
+            state TEXT NOT NULL,
+            pinned_at INTEGER,
+            updated_at INTEGER NOT NULL,
+            good_at TEXT DEFAULT '',
+            PRIMARY KEY (owner_agent_id, peer_id)
+        );
+
+        DROP TABLE IF EXISTS contacts;
+        ALTER TABLE contacts_v3 RENAME TO contacts;
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_pairing_sessions_pair
+        ON pairing_sessions(local_agent_id, peer_id);
+        """,
+    ),
 ]
 
 
@@ -143,6 +180,7 @@ class AgentRecord:
 class ContactRecord:
     """Peer contact record."""
 
+    owner_agent_id: str
     peer_id: str
     name: str
     pubkey: bytes
@@ -314,6 +352,7 @@ class Store:
     # Contact operations
     async def create_or_update_contact(
         self,
+        owner_agent_id: str,
         peer_id: str,
         name: str,
         pubkey: bytes,
@@ -322,13 +361,29 @@ class Store:
         good_at: str = "",
     ) -> ContactRecord:
         now_ms = int(time.time() * 1000)
+        existing = await self.get_contact(owner_agent_id, peer_id)
+        if existing and existing.pinned_at is not None:
+            if existing.pubkey != pubkey:
+                raise KeyPinningViolationError(
+                    f"CRITICAL: Key pinning violation for contact {peer_id}! "
+                    f"Attempted to upsert key {pubkey.hex()[:12]}... but contact is pinned "
+                    f"to {existing.pubkey.hex()[:12]}..."
+                )
+            pubkey_to_save = existing.pubkey
+        else:
+            pubkey_to_save = pubkey
+
         await self.db.execute(
             """
-            INSERT INTO contacts (peer_id, name, pubkey, state, pinned_at, updated_at, good_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(peer_id) DO UPDATE SET
+            INSERT INTO contacts (
+                owner_agent_id, peer_id, name, pubkey, state, pinned_at, updated_at, good_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(owner_agent_id, peer_id) DO UPDATE SET
                 name = excluded.name,
-                pubkey = excluded.pubkey,
+                pubkey = CASE
+                    WHEN contacts.pinned_at IS NOT NULL THEN contacts.pubkey
+                    ELSE excluded.pubkey
+                END,
                 state = excluded.state,
                 pinned_at = COALESCE(excluded.pinned_at, contacts.pinned_at),
                 updated_at = excluded.updated_at,
@@ -337,29 +392,35 @@ class Store:
                     ELSE contacts.good_at
                 END;
             """,
-            (peer_id, name, pubkey, state, pinned_at, now_ms, good_at),
+            (owner_agent_id, peer_id, name, pubkey_to_save, state, pinned_at, now_ms, good_at),
         )
         await self.db.commit()
         return ContactRecord(
+            owner_agent_id=owner_agent_id,
             peer_id=peer_id,
             name=name,
-            pubkey=pubkey,
+            pubkey=pubkey_to_save,
             state=state,
-            pinned_at=pinned_at,
+            pinned_at=(
+                pinned_at
+                if pinned_at is not None
+                else (existing.pinned_at if existing else None)
+            ),
             updated_at=now_ms,
-            good_at=good_at,
+            good_at=good_at or (existing.good_at if existing else ""),
         )
 
-    async def get_contact(self, peer_id: str) -> ContactRecord | None:
+    async def get_contact(self, owner_agent_id: str, peer_id: str) -> ContactRecord | None:
         async with self.db.execute(
-            "SELECT peer_id, name, pubkey, state, pinned_at, updated_at, good_at "
-            "FROM contacts WHERE peer_id = ?;",
-            (peer_id,),
+            "SELECT owner_agent_id, peer_id, name, pubkey, state, pinned_at, updated_at, good_at "
+            "FROM contacts WHERE owner_agent_id = ? AND peer_id = ?;",
+            (owner_agent_id, peer_id),
         ) as cursor:
             row = await cursor.fetchone()
             if not row:
                 return None
             return ContactRecord(
+                owner_agent_id=str(row["owner_agent_id"]),
                 peer_id=str(row["peer_id"]),
                 name=str(row["name"]),
                 pubkey=bytes(row["pubkey"]),
@@ -369,20 +430,24 @@ class Store:
                 good_at=str(row["good_at"] or ""),
             )
 
-    async def list_contacts(self, state: str | None = None) -> list[ContactRecord]:
+    async def list_contacts(
+        self, owner_agent_id: str, state: str | None = None
+    ) -> list[ContactRecord]:
         query = (
-            "SELECT peer_id, name, pubkey, state, pinned_at, updated_at, good_at FROM contacts"
+            "SELECT owner_agent_id, peer_id, name, pubkey, state, pinned_at, updated_at, good_at "
+            "FROM contacts WHERE owner_agent_id = ?"
         )
-        params: tuple[Any, ...] = ()
+        params: list[Any] = [owner_agent_id]
         if state:
-            query += " WHERE state = ?"
-            params = (state,)
+            query += " AND state = ?"
+            params.append(state)
         query += " ORDER BY updated_at DESC;"
 
-        async with self.db.execute(query, params) as cursor:
+        async with self.db.execute(query, tuple(params)) as cursor:
             rows = await cursor.fetchall()
             return [
                 ContactRecord(
+                    owner_agent_id=str(row["owner_agent_id"]),
                     peer_id=str(row["peer_id"]),
                     name=str(row["name"]),
                     pubkey=bytes(row["pubkey"]),
@@ -395,7 +460,7 @@ class Store:
             ]
 
     async def update_contact_state(
-        self, peer_id: str, state: str, pinned_at: int | None = None
+        self, owner_agent_id: str, peer_id: str, state: str, pinned_at: int | None = None
     ) -> bool:
         now_ms = int(time.time() * 1000)
         query = "UPDATE contacts SET state = ?, updated_at = ?"
@@ -403,26 +468,32 @@ class Store:
         if pinned_at is not None:
             query += ", pinned_at = ?"
             params.append(pinned_at)
-        query += " WHERE peer_id = ?;"
-        params.append(peer_id)
+        query += " WHERE owner_agent_id = ? AND peer_id = ?;"
+        params.extend([owner_agent_id, peer_id])
 
         async with self.db.execute(query, tuple(params)) as cursor:
             await self.db.commit()
             return cursor.rowcount > 0
 
-    async def update_contact_good_at(self, peer_id: str, good_at: str) -> bool:
+    async def update_contact_good_at(
+        self, owner_agent_id: str, peer_id: str, good_at: str
+    ) -> bool:
         now_ms = int(time.time() * 1000)
+        query = (
+            "UPDATE contacts SET good_at = ?, updated_at = ? "
+            "WHERE owner_agent_id = ? AND peer_id = ?;"
+        )
         async with self.db.execute(
-            "UPDATE contacts SET good_at = ?, updated_at = ? WHERE peer_id = ?;",
-            (good_at, now_ms, peer_id),
+            query,
+            (good_at, now_ms, owner_agent_id, peer_id),
         ) as cursor:
             await self.db.commit()
             return cursor.rowcount > 0
 
-    async def delete_contact(self, peer_id: str) -> bool:
+    async def delete_contact(self, owner_agent_id: str, peer_id: str) -> bool:
         async with self.db.execute(
-            "DELETE FROM contacts WHERE peer_id = ?;",
-            (peer_id,),
+            "DELETE FROM contacts WHERE owner_agent_id = ? AND peer_id = ?;",
+            (owner_agent_id, peer_id),
         ) as cursor:
             await self.db.commit()
             return cursor.rowcount > 0
@@ -446,7 +517,16 @@ class Store:
             INSERT INTO pairing_sessions (
                 session_id, local_agent_id, peer_id, nonce_local, nonce_peer,
                 code, state, attempts, expires_at, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(local_agent_id, peer_id) DO UPDATE SET
+                session_id = excluded.session_id,
+                nonce_local = excluded.nonce_local,
+                nonce_peer = excluded.nonce_peer,
+                code = excluded.code,
+                state = excluded.state,
+                attempts = excluded.attempts,
+                expires_at = excluded.expires_at,
+                created_at = excluded.created_at;
             """,
             (
                 session_id,

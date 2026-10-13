@@ -13,7 +13,16 @@ from shake.ulid import generate_ulid
 # Default clock skew tolerance: 5 minutes (300,000 ms)
 DEFAULT_TIMESTAMP_TOLERANCE_MS: int = 5 * 60 * 1000
 
-MessageType = Literal["text", "room", "ack", "reply", "status", "system"]
+MessageType = Literal[
+    "text",
+    "room",
+    "ack",
+    "reply",
+    "status",
+    "system",
+    "connect_req",
+    "connect_ack",
+]
 MessageStatus = Literal["ok", "timeout", "busy", "expired", "noop"]
 
 ENVELOPE_CANONICAL_KEYS = [
@@ -218,3 +227,24 @@ class IpcResponse:
             data=raw.get("data"),
             error=str(raw["error"]) if raw.get("error") is not None else None,
         )
+
+
+def envelope_to_blob(envelope: Envelope) -> str:
+    """Encode an envelope into a URL-safe Base64 token string."""
+    import base64
+
+    return base64.urlsafe_b64encode(envelope.encode()).decode("ascii")
+
+
+def blob_to_envelope(blob: str) -> Envelope:
+    """Decode a URL-safe Base64 token string back into an Envelope."""
+    import base64
+
+    raw = base64.urlsafe_b64decode(blob.strip().encode("ascii"))
+    return Envelope.decode(raw)
+
+
+def verify_envelope(envelope: Envelope, pubkey: bytes) -> bool:
+    """Verify an envelope's signature against a public key."""
+    return envelope.verify(pubkey)
+

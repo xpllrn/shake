@@ -138,34 +138,31 @@ def test_cli_handshake_flow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     try:
         # 1. Alice connects to Bob
         monkeypatch.setenv("SHAKE_AGENT", alice_id)
-        res_conn1 = runner.invoke(app, ["connect", bob_id])
-        assert res_conn1.exit_code == 0
-        assert f"Connect request delivered to {bob_id}" in res_conn1.stdout
-
-        # 2. Bob views contact requests
-        monkeypatch.setenv("SHAKE_AGENT", bob_id)
-        res_reqs = runner.invoke(app, ["contact", "requests"])
-        assert res_reqs.exit_code == 0
-        assert alice_id in res_reqs.stdout
-
-        # 3. Bob accepts connection
-        res_conn2 = runner.invoke(app, ["connect", alice_id])
-        assert res_conn2.exit_code == 0
-        assert "Pairing request accepted!" in res_conn2.stdout
-        assert "Mutual verification code:" in res_conn2.stdout
+        res_conn = runner.invoke(app, ["connect", bob_id])
+        assert res_conn.exit_code == 0
+        assert "Handshake established" in res_conn.stdout
+        assert "Mutual SAS code:" in res_conn.stdout
+        assert "Both sides must now verify independently:" in res_conn.stdout
 
         # Extract 6-digit code
-        match = re.search(r"\b(\d{6})\b", res_conn2.stdout)
+        match = re.search(r"\b(\d{6})\b", res_conn.stdout)
         assert match is not None
         code = match.group(1)
 
-        # 4. Alice verifies with 6-digit code
+        # 2. Alice verifies with 6-digit code
         monkeypatch.setenv("SHAKE_AGENT", alice_id)
-        res_verify = runner.invoke(app, ["verify", bob_id, code])
-        assert res_verify.exit_code == 0
-        assert "Mutual verification successful!" in res_verify.stdout
+        res_verify_a = runner.invoke(app, ["verify", bob_id, code])
+        assert res_verify_a.exit_code == 0
+        assert "Mutual verification successful!" in res_verify_a.stdout
 
-        # 5. List contacts
+        # 3. Bob verifies independently with 6-digit code
+        monkeypatch.setenv("SHAKE_AGENT", bob_id)
+        res_verify_b = runner.invoke(app, ["verify", alice_id, code])
+        assert res_verify_b.exit_code == 0
+        assert "Mutual verification successful!" in res_verify_b.stdout
+
+        # 4. List contacts for Alice
+        monkeypatch.setenv("SHAKE_AGENT", alice_id)
         res_contacts = runner.invoke(app, ["contact", "list"])
         assert res_contacts.exit_code == 0
         assert bob_id in res_contacts.stdout

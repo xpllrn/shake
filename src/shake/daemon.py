@@ -149,17 +149,20 @@ class Daemon:
 
             elif action == "connect":
                 local_agent_id = str(params.get("local_agent_id", "")).strip()
-                peer_id = str(params.get("peer_id", "")).strip()
-                peer_name = str(params.get("peer_name", "")).strip()
-                peer_pubkey_raw = params.get("peer_pubkey")
-                peer_pubkey = bytes(peer_pubkey_raw) if peer_pubkey_raw else None
-
-                result = await self.pairing.initiate_connect(
-                    local_agent_id=local_agent_id,
-                    peer_id=peer_id,
-                    peer_name=peer_name,
-                    peer_pubkey=peer_pubkey,
-                )
+                token = params.get("token")
+                if token:
+                    result = await self.pairing.process_connect_token(
+                        local_agent_id=local_agent_id,
+                        token=str(token),
+                    )
+                else:
+                    peer_id = str(params.get("peer_id", "")).strip()
+                    peer_name = str(params.get("peer_name", "")).strip()
+                    result = await self.pairing.initiate_connect(
+                        local_agent_id=local_agent_id,
+                        peer_id=peer_id,
+                        peer_name=peer_name,
+                    )
                 resp = IpcResponse(id=req_id, ok=True, data=result)
 
             elif action == "verify":
@@ -167,12 +170,12 @@ class Daemon:
                 peer_id = str(params.get("peer_id", "")).strip()
                 code = str(params.get("code", "")).strip()
 
-                result = await self.pairing.verify_code(
+                verify_ok = await self.pairing.verify_code(
                     local_agent_id=local_agent_id,
                     peer_id=peer_id,
                     code=code,
                 )
-                resp = IpcResponse(id=req_id, ok=True, data=result)
+                resp = IpcResponse(id=req_id, ok=True, data={"verified": verify_ok})
 
             elif action == "disconnect":
                 local_agent_id = str(params.get("local_agent_id", "")).strip()
@@ -185,9 +188,11 @@ class Daemon:
                 )
 
             elif action == "contact_list":
+                local_agent_id = str(params.get("local_agent_id", "")).strip()
                 state_filter = params.get("state")
                 contacts = await self.store.list_contacts(
-                    state=str(state_filter) if state_filter else None
+                    owner_agent_id=local_agent_id,
+                    state=str(state_filter) if state_filter else None,
                 )
                 contacts_data = [
                     {
@@ -205,7 +210,9 @@ class Daemon:
 
             elif action == "contact_requests":
                 local_agent_id = str(params.get("local_agent_id", "")).strip()
-                contacts = await self.store.list_contacts(state="requested_in")
+                contacts = await self.store.list_contacts(
+                    owner_agent_id=local_agent_id, state="requested_in"
+                )
                 contacts_data = [
                     {
                         "peer_id": c.peer_id,
@@ -220,22 +227,25 @@ class Daemon:
                 resp = IpcResponse(id=req_id, ok=True, data={"requests": contacts_data})
 
             elif action == "contact_trust":
+                local_agent_id = str(params.get("local_agent_id", "")).strip()
                 peer_id = str(params.get("peer_id", "")).strip()
-                success = await self.pairing.trust(peer_id)
+                success = await self.pairing.trust(local_agent_id, peer_id)
                 resp = IpcResponse(
                     id=req_id, ok=True, data={"trusted": success, "peer_id": peer_id}
                 )
 
             elif action == "contact_block":
+                local_agent_id = str(params.get("local_agent_id", "")).strip()
                 peer_id = str(params.get("peer_id", "")).strip()
-                success = await self.pairing.block(peer_id)
+                success = await self.pairing.block(local_agent_id, peer_id)
                 resp = IpcResponse(
                     id=req_id, ok=True, data={"blocked": success, "peer_id": peer_id}
                 )
 
             elif action == "contact_unblock":
+                local_agent_id = str(params.get("local_agent_id", "")).strip()
                 peer_id = str(params.get("peer_id", "")).strip()
-                success = await self.pairing.unblock(peer_id)
+                success = await self.pairing.unblock(local_agent_id, peer_id)
                 resp = IpcResponse(
                     id=req_id, ok=True, data={"unblocked": success, "peer_id": peer_id}
                 )
@@ -249,9 +259,12 @@ class Daemon:
                 )
 
             elif action == "contact_good_at":
+                local_agent_id = str(params.get("local_agent_id", "")).strip()
                 peer_id = str(params.get("peer_id", "")).strip()
                 good_at = str(params.get("good_at", "")).strip()
-                success = await self.store.update_contact_good_at(peer_id, good_at)
+                success = await self.store.update_contact_good_at(
+                    owner_agent_id=local_agent_id, peer_id=peer_id, good_at=good_at
+                )
                 resp = IpcResponse(
                     id=req_id, ok=True, data={"updated": success, "good_at": good_at}
                 )

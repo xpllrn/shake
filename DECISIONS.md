@@ -64,6 +64,19 @@ This document records architectural and implementation decisions for `shake`.
   - Tincan used static invite codes. Shake uses an ephemeral, symmetric 6-digit out-of-band verification handshake with cryptographic nonces and a 3-attempt lockout.
 - **Fixed Limit 3: Guaranteed 60-Second Reply Deadline**:
   - Tincan queued requests indefinitely. Shake enforces an instant ACK and a hard 60-second reply deadline with receiving runtime timeout fallback at 45 seconds.
-- **Fixed Limit 4: Conversation Turn Cap & Deduping**:
-  - Tincan allowed infinite agent loops. Shake enforces a 20-turn cap per thread and duplicate message filtering via monotonic ULIDs.
+## 12. Scoped Contacts & Pinned Key Immutability
+- **Decision**: `contacts` table is keyed by `(owner_agent_id, peer_id)`. `pairing_sessions` table has a UNIQUE index on `(local_agent_id, peer_id)`.
+- **Key Pinning Rule**: A pinned public key (`pinned_at IS NOT NULL`) is strictly immutable. If an incoming connection attempts to upsert or alter an existing pinned public key with a mismatched key, `KeyPinningViolationError` is raised immediately, and the SQL upsert utilizes `CASE WHEN contacts.pinned_at IS NOT NULL THEN contacts.pubkey ELSE excluded.pubkey END`.
+
+## 13. Elimination of Dual-Writing & Network Symmetry
+- **Decision**: The daemon and CLI never mutate the peer agent's records locally, even if the peer happens to reside in the same local database.
+- **Rationale**: Treats two agents on the same host identically to two agents on separate machines across the internet. Prevents shortcut vulnerabilities and architectural divergence when remote transports (NATS, WebRTC, relay) are used.
+
+## 14. Signed Connect Envelopes & Offline Exchange
+- **Decision**: Connection requests (`connect_req`) and acknowledgments (`connect_ack`) are packaged as canonical, Ed25519-signed MessagePack envelopes.
+- **Air-gapped / File Transport**: Connection tokens are URL-safe base64 strings containing the signed envelope. Operators or autonomous runtimes can exchange them directly via `--from-blob <token>` or `--from-file <path>`.
+
+## 15. Independent Mutual SAS Verification UX
+- **Decision**: The CLI displays the computed 6-digit SAS code, explains the security rationale, and explicitly instructs the operator to verify that the peer displays the exact same code out-of-band.
+- **No Pre-filling**: The verification command is never pre-filled with the local code in prompts. Both agents/operators must independently verify the session by running `shake verify <peer_id> <code>` using the code confirmed with their peer.
 
