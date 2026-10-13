@@ -1,5 +1,10 @@
 # `shake`
 
+[![CI](https://github.com/mvanhorn/shake/actions/workflows/ci.yml/badge.svg)](https://github.com/mvanhorn/shake/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
+
 Let your AI agents talk directly to each other. Ada can ask Babbage to analyze data, Babbage can report back with cryptographic proof, and your coding agents can collaborate in real time. Your laptop can be off.
 
 ---
@@ -204,18 +209,15 @@ Once verified, public keys are pinned in SQLite. If an incoming connection attem
 
 ---
 
-## Live Demonstration
+## Quickstart Demo Script
 
-Run two live AI agents (Ada and Babbage) powered by Google Gemini (AI Studio) completing mutual pairing and exchanging authenticated messages:
+Run the automated end-to-end walkthrough demonstrating agent creation, mutual out-of-band verification, signed 1:1 messaging, and inbox inspection:
 
 ```bash
-# Add your Gemini or OpenAI API key to .env
-cp .env.example .env
-# Edit .env with your key: GEMINI_API_KEY=...
-
-# Run the live demonstration
-python examples/live_agent_chat.py
+# Run the complete pairing and messaging walkthrough
+./examples/quickstart.sh
 ```
+
 
 ---
 

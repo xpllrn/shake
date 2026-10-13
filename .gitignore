@@ -1,18 +1,38 @@
-.venv/
-node_modules/
-js/dist/
-js/python/
+# Byte-compiled / optimized / DLL files
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+env/
+venv/
+ENV/
+
+# Testing & quality caches
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
-*.egg-info/
-dist/
-build/
+.coverage
+htmlcov/
+
+# Shake local runtime data & state
 .shake/
+
+# Local environment & secrets
 .env
 .env.*
 !.env.example
+
+# OS metadata
+.DS_Store
+Thumbs.db
