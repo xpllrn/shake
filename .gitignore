@@ -12,3 +12,4 @@ build/
 .shake/
 .env
 .env.*
+!.env.example
