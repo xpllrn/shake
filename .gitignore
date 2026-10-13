@@ -1,4 +1,7 @@
 .venv/
+node_modules/
+js/dist/
+js/python/
 __pycache__/
 *.pyc
 *.pyo
