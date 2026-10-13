@@ -958,3 +958,223 @@ def contact_unblock_cmd(
     except Exception as e:
         err_console.print(f"[red]Error unblocking contact:[/red] {e}")
         raise typer.Exit(code=1)
+
+
+# ---------------------------------------------------------------------------
+# 1:1 Messaging Commands
+# ---------------------------------------------------------------------------
+
+
+@app.command("text")
+def text_cmd(
+    agent_id: str = typer.Argument(..., help="Target agent ID (7 digits)"),
+    message: str = typer.Argument(..., help="Message content to send"),
+    wait: float = typer.Option(60.0, "--wait", help="Seconds to wait for instant ACK / reply"),
+    stream: bool = typer.Option(False, "--stream", help="Stream response tokens"),
+    json_output: bool = typer.Option(False, "--json", help="Output result as JSON"),
+) -> None:
+    """Send a secure 1:1 message to an agent with cryptographic authentication."""
+    config = ShakeConfig()
+    active = resolve_active_agent(config)
+    if not active:
+        err_console.print("[red]Error:[/red] No active agent selected.")
+        raise typer.Exit(code=1)
+
+    local_id = active["agent_id"]
+    client = get_client()
+
+    try:
+        res = client.call_sync(
+            "text",
+            {
+                "sender_id": local_id,
+                "target_id": agent_id,
+                "body": message,
+                "wait_timeout": wait,
+            },
+            timeout=wait + 5.0,
+        )
+        data = res.get("data", {})
+        if json_output:
+            print(json.dumps(data))
+        else:
+            console.print("[bold green]✓ Message delivered and acknowledged![/bold green]")
+            console.print(f"  [cyan]Message ID:[/cyan] {data.get('msg_id')}")
+            console.print(f"  [cyan]ACK ID:[/cyan]     {data.get('ack_msg_id')}")
+            console.print(f"  [cyan]Status:[/cyan]     {data.get('status')}")
+    except Exception as e:
+        err_console.print(f"[red]Failed to send message:[/red] {e}")
+        raise typer.Exit(code=1)
+
+
+@app.command("inbox")
+def inbox_cmd(
+    after: str | None = typer.Option(None, "--after", help="Fetch messages after this msg_id"),
+    limit: int = typer.Option(50, "--limit", help="Max messages to fetch"),
+    follow: bool = typer.Option(False, "--follow", help="Stream new messages as they arrive"),
+    json_output: bool = typer.Option(False, "--json", help="Output messages as JSON"),
+) -> None:
+    """Read incoming messages from the local agent inbox."""
+    config = ShakeConfig()
+    active = resolve_active_agent(config)
+    if not active:
+        err_console.print("[red]Error:[/red] No active agent selected.")
+        raise typer.Exit(code=1)
+
+    local_id = active["agent_id"]
+    client = get_client()
+
+    try:
+        res = client.call_sync(
+            "inbox",
+            {
+                "local_agent_id": local_id,
+                "after_msg_id": after,
+                "limit": limit,
+            },
+        )
+        messages = res.get("data", {}).get("messages", [])
+
+        if json_output:
+            print(json.dumps(messages))
+            return
+
+        if not messages:
+            console.print(f"[dim]Inbox for agent {local_id} ({active.get('name')}) is empty.[/dim]")
+            return
+
+        table = Table(title=f"Inbox for Agent {local_id} ({active.get('name')})")
+        table.add_column("Msg ID", style="dim")
+        table.add_column("From", style="cyan")
+        table.add_column("Time", style="green")
+        table.add_column("State", style="magenta")
+        table.add_column("Body", style="white")
+
+        for m in messages:
+            ts_str = time.strftime("%H:%M:%S", time.localtime(m["ts"] / 1000))
+            table.add_row(
+                m["msg_id"][:10] + "...",
+                m["sender_id"],
+                ts_str,
+                m["state"],
+                str(m["body"]),
+            )
+        console.print(table)
+    except Exception as e:
+        err_console.print(f"[red]Error reading inbox:[/red] {e}")
+        raise typer.Exit(code=1)
+
+
+@app.command("history")
+def history_cmd(
+    peer_id: str = typer.Argument(..., help="Peer agent ID to view conversation with"),
+    limit: int = typer.Option(50, "--limit", help="Max messages to fetch"),
+    json_output: bool = typer.Option(False, "--json", help="Output history as JSON"),
+) -> None:
+    """View conversation history with a specific peer contact."""
+    config = ShakeConfig()
+    active = resolve_active_agent(config)
+    if not active:
+        err_console.print("[red]Error:[/red] No active agent selected.")
+        raise typer.Exit(code=1)
+
+    local_id = active["agent_id"]
+    client = get_client()
+
+    try:
+        res = client.call_sync(
+            "history",
+            {
+                "local_agent_id": local_id,
+                "peer_id": peer_id,
+                "limit": limit,
+            },
+        )
+        messages = res.get("data", {}).get("messages", [])
+
+        if json_output:
+            print(json.dumps(messages))
+            return
+
+        if not messages:
+            console.print(f"[dim]No message history with agent {peer_id}.[/dim]")
+            return
+
+        table = Table(title=f"History between Agent {local_id} and Agent {peer_id}")
+        table.add_column("Direction", style="bold")
+        table.add_column("From -> To", style="cyan")
+        table.add_column("Time", style="green")
+        table.add_column("Status", style="magenta")
+        table.add_column("Body", style="white")
+
+        for m in messages:
+            dir_label = "OUT ➔" if m["direction"] == "outbound" else "IN  ⬅"
+            style = "blue" if m["direction"] == "outbound" else "green"
+            ts_str = time.strftime("%H:%M:%S", time.localtime(m["ts"] / 1000))
+            table.add_row(
+                f"[{style}]{dir_label}[/{style}]",
+                f"{m['sender_id']} ➔ {m['target_id']}",
+                ts_str,
+                m["state"],
+                str(m["body"]),
+            )
+        console.print(table)
+    except Exception as e:
+        err_console.print(f"[red]Error fetching history:[/red] {e}")
+        raise typer.Exit(code=1)
+
+
+@app.command("wait")
+def wait_cmd(
+    timeout: float = typer.Option(60.0, "--timeout", help="Seconds to wait for incoming message"),
+    json_output: bool = typer.Option(False, "--json", help="Output message as JSON"),
+) -> None:
+    """Pull loop for sandboxed agents: block until a message arrives or timeout expires."""
+    config = ShakeConfig()
+    active = resolve_active_agent(config)
+    if not active:
+        err_console.print("[red]Error:[/red] No active agent selected.")
+        raise typer.Exit(code=1)
+
+    local_id = active["agent_id"]
+    client = get_client()
+
+    deadline = time.time() + timeout
+    last_seen_id: str | None = None
+
+    try:
+        init_res = client.call_sync("inbox", {"local_agent_id": local_id, "limit": 1})
+        init_msgs = init_res.get("data", {}).get("messages", [])
+        if init_msgs:
+            last_seen_id = init_msgs[-1]["msg_id"]
+    except Exception:
+        pass
+
+    while time.time() < deadline:
+        try:
+            res = client.call_sync(
+                "inbox",
+                {
+                    "local_agent_id": local_id,
+                    "after_msg_id": last_seen_id,
+                    "limit": 1,
+                },
+            )
+            messages = res.get("data", {}).get("messages", [])
+            if messages:
+                msg = messages[0]
+                if json_output:
+                    print(json.dumps(msg))
+                else:
+                    console.print(
+                        f"[bold green]Message from {msg['sender_id']}:[/bold green] {msg['body']}"
+                    )
+                return
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+    if json_output:
+        print(json.dumps({"status": "timeout"}))
+    else:
+        console.print("[dim]Wait timeout expired. No new messages.[/dim]")

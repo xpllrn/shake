@@ -70,3 +70,61 @@ async def test_daemon_lifecycle_and_agent_ipc(tmp_path: Path) -> None:
 
     await task
     assert not config.socket_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_daemon_messaging_ipc(tmp_path: Path) -> None:
+    config = ShakeConfig(home=tmp_path)
+    daemon = Daemon(config)
+    task = asyncio.create_task(daemon.run())
+    client = ShakeClient(config)
+
+    for _ in range(50):
+        if config.socket_path.exists():
+            try:
+                res = await client.call("ping")
+                if res.get("data") == "pong":
+                    break
+            except Exception:
+                pass
+        await asyncio.sleep(0.05)
+
+    # 1. Create two agents
+    a1 = (await client.call("agent_create", {"name": "Alice"}))["data"]["agent_id"]
+    a2 = (await client.call("agent_create", {"name": "Bob"}))["data"]["agent_id"]
+
+    # 2. Pair them
+    conn_a = (await client.call("connect", {"local_agent_id": a1, "peer_id": a2}))["data"]
+    code = conn_a["code"]
+    await client.call("verify", {"local_agent_id": a1, "peer_id": a2, "code": code})
+    await client.call("verify", {"local_agent_id": a2, "peer_id": a1, "code": code})
+
+    # 3. Heartbeat
+    hb_res = await client.call("heartbeat", {"agent_id": a2, "status": "online"})
+    assert hb_res["data"]["heartbeat"] == "recorded"
+
+    # 4. Send text from Alice to Bob
+    text_res = await client.call(
+        "text",
+        {
+            "sender_id": a1,
+            "target_id": a2,
+            "body": "Hello Bob from Daemon IPC",
+        },
+    )
+    assert text_res["data"]["status"] == "acked"
+    msg_id = text_res["data"]["msg_id"]
+
+    # 5. Check Bob's inbox
+    inbox_res = await client.call("inbox", {"local_agent_id": a2})
+    msgs = inbox_res["data"]["messages"]
+    assert len(msgs) == 1
+    assert msgs[0]["msg_id"] == msg_id
+    assert msgs[0]["body"] == "Hello Bob from Daemon IPC"
+
+    # 6. Check history
+    hist_res = await client.call("history", {"local_agent_id": a1, "peer_id": a2})
+    assert len(hist_res["data"]["messages"]) == 1
+
+    await client.call("stop")
+    await task

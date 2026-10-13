@@ -10,6 +10,7 @@ from pathlib import Path
 
 from shake.config import ShakeConfig
 from shake.crypto import KeyPair, format_fingerprint, generate_agent_id
+from shake.delivery import DeliveryManager
 from shake.pairing import PairingManager
 from shake.protocol import IpcRequest, IpcResponse
 from shake.store import Store
@@ -24,7 +25,8 @@ class Daemon:
     def __init__(self, config: ShakeConfig | None = None) -> None:
         self.config = config or ShakeConfig()
         self.store = Store(self.config.db_path)
-        self.pairing = PairingManager(self.store)
+        self.pairing = PairingManager(self.store, self.config)
+        self.delivery = DeliveryManager(self.store, self.config)
         self.transport = UnixTransport(self.config.socket_path)
         self.start_time: float = 0.0
         self._stop_event = asyncio.Event()
@@ -267,6 +269,103 @@ class Daemon:
                 )
                 resp = IpcResponse(
                     id=req_id, ok=True, data={"updated": success, "good_at": good_at}
+                )
+
+            elif action == "text":
+                sender_id = str(params.get("sender_id", "")).strip()
+                target_id = str(params.get("target_id", "")).strip()
+                body = str(params.get("body", ""))
+                wait_timeout = float(params.get("wait_timeout", 60.0))
+                check_presence = bool(params.get("check_presence", False))
+
+                sent_env, ack_env = await self.delivery.send_text(
+                    sender_id=sender_id,
+                    target_id=target_id,
+                    body=body,
+                    wait_timeout=wait_timeout,
+                    check_presence=check_presence,
+                )
+                resp = IpcResponse(
+                    id=req_id,
+                    ok=True,
+                    data={
+                        "msg_id": sent_env.msg_id,
+                        "status": "acked",
+                        "ack_msg_id": ack_env.msg_id,
+                        "ts": sent_env.ts,
+                    },
+                )
+
+            elif action == "inbox":
+                local_agent_id = str(params.get("local_agent_id", "")).strip()
+                after_msg_id = params.get("after_msg_id")
+                limit = int(params.get("limit", 50))
+                messages = await self.store.get_inbox(
+                    owner_agent_id=local_agent_id,
+                    after_msg_id=str(after_msg_id) if after_msg_id else None,
+                    limit=limit,
+                )
+                resp = IpcResponse(
+                    id=req_id,
+                    ok=True,
+                    data={
+                        "messages": [
+                            {
+                                "msg_id": m.msg_id,
+                                "sender_id": m.sender_id,
+                                "target_id": m.target_id,
+                                "ts": m.ts,
+                                "state": m.state,
+                                "reply_to": m.reply_to,
+                                "body": m.body,
+                            }
+                            for m in messages
+                        ]
+                    },
+                )
+
+            elif action == "history":
+                local_agent_id = str(params.get("local_agent_id", "")).strip()
+                peer_id = str(params.get("peer_id", "")).strip()
+                limit = int(params.get("limit", 50))
+                messages = await self.store.get_history(
+                    owner_agent_id=local_agent_id,
+                    peer_id=peer_id,
+                    limit=limit,
+                )
+                resp = IpcResponse(
+                    id=req_id,
+                    ok=True,
+                    data={
+                        "messages": [
+                            {
+                                "msg_id": m.msg_id,
+                                "direction": m.direction,
+                                "sender_id": m.sender_id,
+                                "target_id": m.target_id,
+                                "ts": m.ts,
+                                "state": m.state,
+                                "reply_to": m.reply_to,
+                                "body": m.body,
+                            }
+                            for m in messages
+                        ]
+                    },
+                )
+
+            elif action == "heartbeat":
+                agent_id = str(params.get("agent_id", "")).strip()
+                status = str(params.get("status", "online"))
+                metadata = params.get("metadata")
+                await self.store.record_heartbeat(
+                    agent_id=agent_id,
+                    status=status,
+                    metadata=str(metadata) if metadata else None,
+                )
+                resp = IpcResponse(
+                    id=req_id,
+                    ok=True,
+                    data={"heartbeat": "recorded", "agent_id": agent_id},
                 )
 
             else:

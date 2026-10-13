@@ -84,7 +84,8 @@ MIGRATIONS: list[tuple[int, str]] = [
         );
 
         CREATE TABLE IF NOT EXISTS messages (
-            msg_id TEXT PRIMARY KEY,
+            owner_agent_id TEXT NOT NULL,
+            msg_id TEXT NOT NULL,
             envelope BLOB NOT NULL,
             direction TEXT NOT NULL,
             state TEXT NOT NULL,
@@ -93,11 +94,16 @@ MIGRATIONS: list[tuple[int, str]] = [
             ts INTEGER NOT NULL,
             reply_to TEXT,
             reply_by INTEGER,
-            body TEXT
+            body TEXT,
+            PRIMARY KEY (owner_agent_id, msg_id)
         );
 
-        CREATE INDEX IF NOT EXISTS idx_messages_to_ts ON messages(target_id, ts);
-        CREATE INDEX IF NOT EXISTS idx_messages_from_ts ON messages(sender_id, ts);
+        CREATE INDEX IF NOT EXISTS idx_messages_owner_target_ts
+        ON messages(owner_agent_id, target_id, ts);
+        CREATE INDEX IF NOT EXISTS idx_messages_owner_sender_ts
+        ON messages(owner_agent_id, sender_id, ts);
+        CREATE INDEX IF NOT EXISTS idx_messages_owner_ts
+        ON messages(owner_agent_id, ts);
 
         CREATE TABLE IF NOT EXISTS cursors (
             agent_id TEXT NOT NULL,
@@ -162,6 +168,36 @@ MIGRATIONS: list[tuple[int, str]] = [
         ON pairing_sessions(local_agent_id, peer_id);
         """,
     ),
+    (
+        4,
+        """
+        -- Ensure messages table has (owner_agent_id, msg_id) compound primary key
+        CREATE TABLE IF NOT EXISTS messages_v4 (
+            owner_agent_id TEXT NOT NULL,
+            msg_id TEXT NOT NULL,
+            envelope BLOB NOT NULL,
+            direction TEXT NOT NULL,
+            state TEXT NOT NULL,
+            sender_id TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            ts INTEGER NOT NULL,
+            reply_to TEXT,
+            reply_by INTEGER,
+            body TEXT,
+            PRIMARY KEY (owner_agent_id, msg_id)
+        );
+
+        DROP TABLE IF EXISTS messages;
+        ALTER TABLE messages_v4 RENAME TO messages;
+
+        CREATE INDEX IF NOT EXISTS idx_messages_owner_target_ts
+        ON messages(owner_agent_id, target_id, ts);
+        CREATE INDEX IF NOT EXISTS idx_messages_owner_sender_ts
+        ON messages(owner_agent_id, sender_id, ts);
+        CREATE INDEX IF NOT EXISTS idx_messages_owner_ts
+        ON messages(owner_agent_id, ts);
+        """,
+    ),
 ]
 
 
@@ -204,6 +240,33 @@ class PairingSessionRecord:
     attempts: int
     expires_at: int
     created_at: int
+
+
+@dataclass
+class MessageRecord:
+    """Stored message record with direction and state."""
+
+    owner_agent_id: str
+    msg_id: str
+    envelope: bytes
+    direction: str  # "inbound" | "outbound"
+    state: str  # "sent" | "delivered" | "acked" | "replied" | "failed" | "timeout"
+    sender_id: str
+    target_id: str
+    ts: int
+    reply_to: str | None = None
+    reply_by: int | None = None
+    body: str | None = None
+
+
+@dataclass
+class HeartbeatRecord:
+    """Agent heartbeat and presence record."""
+
+    agent_id: str
+    last_seen: int
+    status: str
+    metadata: str | None = None
 
 
 def run_sync_migrations(db_path: Path) -> None:
@@ -678,3 +741,307 @@ class Store:
         async with self.db.execute(query, (local_agent_id,)) as cursor:
             row = await cursor.fetchone()
             return int(row[0]) if row else 0
+
+    # ---------------------------------------------------------------------------
+    # Messages & Inbox
+    # ---------------------------------------------------------------------------
+
+    async def save_message(
+        self,
+        owner_agent_id: str,
+        msg_id: str,
+        envelope: bytes,
+        direction: str,
+        state: str,
+        sender_id: str,
+        target_id: str,
+        ts: int,
+        reply_to: str | None = None,
+        reply_by: int | None = None,
+        body: str | None = None,
+    ) -> MessageRecord:
+        """Save a message record scoped to owner_agent_id."""
+        query = """
+            INSERT INTO messages (
+                owner_agent_id, msg_id, envelope, direction, state,
+                sender_id, target_id, ts, reply_to, reply_by, body
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(owner_agent_id, msg_id) DO UPDATE SET
+                state = excluded.state,
+                envelope = excluded.envelope;
+        """
+        async with self.db.execute(
+            query,
+            (
+                owner_agent_id,
+                msg_id,
+                envelope,
+                direction,
+                state,
+                sender_id,
+                target_id,
+                ts,
+                reply_to,
+                reply_by,
+                body,
+            ),
+        ):
+            await self.db.commit()
+
+        return MessageRecord(
+            owner_agent_id=owner_agent_id,
+            msg_id=msg_id,
+            envelope=envelope,
+            direction=direction,
+            state=state,
+            sender_id=sender_id,
+            target_id=target_id,
+            ts=ts,
+            reply_to=reply_to,
+            reply_by=reply_by,
+            body=body,
+        )
+
+    async def get_message(
+        self, owner_agent_id: str, msg_id: str
+    ) -> MessageRecord | None:
+        """Retrieve a specific message by owner and message ID."""
+        query = """
+            SELECT owner_agent_id, msg_id, envelope, direction, state,
+                   sender_id, target_id, ts, reply_to, reply_by, body
+            FROM messages
+            WHERE owner_agent_id = ? AND msg_id = ?;
+        """
+        async with self.db.execute(query, (owner_agent_id, msg_id)) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            return MessageRecord(
+                owner_agent_id=str(row[0]),
+                msg_id=str(row[1]),
+                envelope=bytes(row[2]),
+                direction=str(row[3]),
+                state=str(row[4]),
+                sender_id=str(row[5]),
+                target_id=str(row[6]),
+                ts=int(row[7]),
+                reply_to=str(row[8]) if row[8] is not None else None,
+                reply_by=int(row[9]) if row[9] is not None else None,
+                body=str(row[10]) if row[10] is not None else None,
+            )
+
+    async def update_message_state(
+        self, owner_agent_id: str, msg_id: str, state: str
+    ) -> bool:
+        """Update the processing state of a message (e.g. sent, acked, replied)."""
+        query = "UPDATE messages SET state = ? WHERE owner_agent_id = ? AND msg_id = ?;"
+        async with self.db.execute(query, (state, owner_agent_id, msg_id)) as cursor:
+            await self.db.commit()
+            return cursor.rowcount > 0
+
+    async def get_inbox(
+        self,
+        owner_agent_id: str,
+        after_msg_id: str | None = None,
+        limit: int = 50,
+    ) -> list[MessageRecord]:
+        """Fetch incoming messages for an agent ordered chronologically."""
+        params: list[Any] = [owner_agent_id]
+        where_clauses = ["owner_agent_id = ?", "direction = 'inbound'"]
+        if after_msg_id:
+            where_clauses.append("msg_id > ?")
+            params.append(after_msg_id)
+
+        query = f"""
+            SELECT owner_agent_id, msg_id, envelope, direction, state,
+                   sender_id, target_id, ts, reply_to, reply_by, body
+            FROM messages
+            WHERE {' AND '.join(where_clauses)}
+            ORDER BY ts ASC, msg_id ASC
+            LIMIT ?;
+        """
+        params.append(limit)
+        async with self.db.execute(query, tuple(params)) as cursor:
+            rows = await cursor.fetchall()
+            return [
+                MessageRecord(
+                    owner_agent_id=str(r[0]),
+                    msg_id=str(r[1]),
+                    envelope=bytes(r[2]),
+                    direction=str(r[3]),
+                    state=str(r[4]),
+                    sender_id=str(r[5]),
+                    target_id=str(r[6]),
+                    ts=int(r[7]),
+                    reply_to=str(r[8]) if r[8] is not None else None,
+                    reply_by=int(r[9]) if r[9] is not None else None,
+                    body=str(r[10]) if r[10] is not None else None,
+                )
+                for r in rows
+            ]
+
+    async def get_history(
+        self,
+        owner_agent_id: str,
+        peer_id: str,
+        limit: int = 50,
+    ) -> list[MessageRecord]:
+        """Fetch conversation history between owner and peer."""
+        query = """
+            SELECT owner_agent_id, msg_id, envelope, direction, state,
+                   sender_id, target_id, ts, reply_to, reply_by, body
+            FROM messages
+            WHERE owner_agent_id = ? AND (sender_id = ? OR target_id = ?)
+            ORDER BY ts ASC, msg_id ASC
+            LIMIT ?;
+        """
+        async with self.db.execute(query, (owner_agent_id, peer_id, peer_id, limit)) as cursor:
+            rows = await cursor.fetchall()
+            return [
+                MessageRecord(
+                    owner_agent_id=str(r[0]),
+                    msg_id=str(r[1]),
+                    envelope=bytes(r[2]),
+                    direction=str(r[3]),
+                    state=str(r[4]),
+                    sender_id=str(r[5]),
+                    target_id=str(r[6]),
+                    ts=int(r[7]),
+                    reply_to=str(r[8]) if r[8] is not None else None,
+                    reply_by=int(r[9]) if r[9] is not None else None,
+                    body=str(r[10]) if r[10] is not None else None,
+                )
+                for r in rows
+            ]
+
+    async def count_inbox(self, owner_agent_id: str) -> int:
+        """Count total inbound messages in an agent's inbox."""
+        query = "SELECT COUNT(*) FROM messages WHERE owner_agent_id = ? AND direction = 'inbound';"
+        async with self.db.execute(query, (owner_agent_id,)) as cursor:
+            row = await cursor.fetchone()
+            return int(row[0]) if row else 0
+
+    async def is_recent_duplicate_body(
+        self,
+        sender_id: str,
+        target_id: str,
+        body: str,
+        window_ms: int = 60_000,
+    ) -> bool:
+        """Check if identical body was sent from sender to target within 60s."""
+        cutoff = int(time.time() * 1000) - window_ms
+        query = """
+            SELECT COUNT(*) FROM messages
+            WHERE sender_id = ? AND target_id = ? AND body = ? AND ts > ?;
+        """
+        async with self.db.execute(query, (sender_id, target_id, body, cutoff)) as cursor:
+            row = await cursor.fetchone()
+            return (int(row[0]) if row else 0) > 0
+
+    # ---------------------------------------------------------------------------
+    # Replay Nonce Cache
+    # ---------------------------------------------------------------------------
+
+    async def is_nonce_seen(self, nonce: bytes) -> bool:
+        """Check if a message nonce was already processed and active."""
+        now_ms = int(time.time() * 1000)
+        query = "SELECT COUNT(*) FROM seen_nonces WHERE nonce = ? AND expires_at > ?;"
+        async with self.db.execute(query, (nonce, now_ms)) as cursor:
+            row = await cursor.fetchone()
+            return (int(row[0]) if row else 0) > 0
+
+    async def record_nonce(
+        self, nonce: bytes, sender_id: str, ttl_ms: int = 300_000
+    ) -> None:
+        """Record a seen nonce with TTL (default 5 minutes)."""
+        now_ms = int(time.time() * 1000)
+        expires_at = now_ms + ttl_ms
+        query = """
+            INSERT OR REPLACE INTO seen_nonces (nonce, sender_id, seen_at, expires_at)
+            VALUES (?, ?, ?, ?);
+        """
+        async with self.db.execute(query, (nonce, sender_id, now_ms, expires_at)):
+            await self.db.commit()
+
+    async def cleanup_seen_nonces(self) -> int:
+        """Purge expired nonces."""
+        now_ms = int(time.time() * 1000)
+        query = "DELETE FROM seen_nonces WHERE expires_at < ?;"
+        async with self.db.execute(query, (now_ms,)) as cursor:
+            await self.db.commit()
+            return cursor.rowcount
+
+    # ---------------------------------------------------------------------------
+    # Cursors
+    # ---------------------------------------------------------------------------
+
+    async def get_cursor(
+        self, agent_id: str, stream_key: str
+    ) -> tuple[str, int] | None:
+        """Get the last processed message ID and timestamp for a stream."""
+        query = "SELECT last_msg_id, last_ts FROM cursors WHERE agent_id = ? AND stream_key = ?;"
+        async with self.db.execute(query, (agent_id, stream_key)) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            return str(row[0]), int(row[1])
+
+    async def update_cursor(
+        self, agent_id: str, stream_key: str, last_msg_id: str, last_ts: int
+    ) -> None:
+        """Update monotonic reading cursor."""
+        now_ms = int(time.time() * 1000)
+        query = """
+            INSERT INTO cursors (agent_id, stream_key, last_msg_id, last_ts, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(agent_id, stream_key) DO UPDATE SET
+                last_msg_id = excluded.last_msg_id,
+                last_ts = excluded.last_ts,
+                updated_at = excluded.updated_at;
+        """
+        async with self.db.execute(
+            query, (agent_id, stream_key, last_msg_id, last_ts, now_ms)
+        ):
+            await self.db.commit()
+
+    # ---------------------------------------------------------------------------
+    # Presence & Heartbeats
+    # ---------------------------------------------------------------------------
+
+    async def record_heartbeat(
+        self, agent_id: str, status: str = "online", metadata: str | None = None
+    ) -> None:
+        """Record agent heartbeat with timestamp."""
+        now_ms = int(time.time() * 1000)
+        query = """
+            INSERT INTO heartbeats (agent_id, last_seen, status, metadata)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(agent_id) DO UPDATE SET
+                last_seen = excluded.last_seen,
+                status = excluded.status,
+                metadata = COALESCE(excluded.metadata, heartbeats.metadata);
+        """
+        async with self.db.execute(query, (agent_id, now_ms, status, metadata)):
+            await self.db.commit()
+
+    async def get_heartbeat(self, agent_id: str) -> HeartbeatRecord | None:
+        """Fetch current agent heartbeat status."""
+        query = "SELECT agent_id, last_seen, status, metadata FROM heartbeats WHERE agent_id = ?;"
+        async with self.db.execute(query, (agent_id,)) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            return HeartbeatRecord(
+                agent_id=str(row[0]),
+                last_seen=int(row[1]),
+                status=str(row[2]),
+                metadata=str(row[3]) if row[3] is not None else None,
+            )
+
+    async def is_agent_online(self, agent_id: str, timeout_ms: int = 30_000) -> bool:
+        """Check if an agent sent a heartbeat within the timeout window."""
+        hb = await self.get_heartbeat(agent_id)
+        if not hb:
+            return False
+        now_ms = int(time.time() * 1000)
+        return (now_ms - hb.last_seen) <= timeout_ms and hb.status == "online"

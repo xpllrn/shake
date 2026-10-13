@@ -80,3 +80,15 @@ This document records architectural and implementation decisions for `shake`.
 - **Decision**: The CLI displays the computed 6-digit SAS code, explains the security rationale, and explicitly instructs the operator to verify that the peer displays the exact same code out-of-band.
 - **No Pre-filling**: The verification command is never pre-filled with the local code in prompts. Both agents/operators must independently verify the session by running `shake verify <peer_id> <code>` using the code confirmed with their peer.
 
+## 16. 1:1 Message Delivery Architecture & Instant ACK
+- **Decision**: Every message is packaged into an authenticated `Envelope` signed with Ed25519 and verified against the recipient's pinned public key.
+- **Instant ACK**: The recipient daemon generates an instant `ack` envelope without invoking the LLM model, confirming delivery within < 10ms.
+- **Deduplication & Replay Prevention**: Nonces are cached with a 5-minute TTL; identical message bodies within 60 seconds are dropped.
+
+## 17. 60-Second Reply Guarantee & Fallback Watchdog (45s)
+- **Decision**: The receiving daemon allocates an adapter budget of `min(45s, reply_by - now - 5s)`. If the target agent adapter does not produce a response within this window, the daemon automatically generates a fallback reply envelope with `status: "timeout"`.
+- **Fast Fail for Offline Agents**: If a target agent's heartbeat is stale (>30s), delivery fails immediately rather than waiting for the timeout.
+
+## 18. Google Gemini AI Studio Adapter
+- **Decision**: Implemented `APIAdapter` utilizing Google's Gemini models (`gemini-3.5-flash-lite`) via native HTTP requests with zero heavy third-party SDK dependencies. System prompts enforce zero-instruction-execution from peers, secret privacy, and NOOP silence.
+
